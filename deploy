@@ -1,0 +1,1063 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 [ernolf] Raphael Gradenwitz
+# SPDX-License-Identifier: MIT
+#
+# deploy — personal package manager for gist-based mini-packages
+#
+# Manages custom server configurations, scripts, and system integrations
+# stored as GitHub Gists conforming to the Mini-Deploy Package Standard.
+#
+# Usage:
+#   deploy me                         Install deploy itself (run once as root)
+#   deploy install <gist-id>          Clone gist and run deploy.sh install
+#   deploy remove  <name>             Run deploy.sh remove and deregister
+#   deploy update  me                 Update deploy itself from the repository
+#   deploy update  [<name>|--all]     git pull + deploy.sh update
+#   deploy status  [<name>]           Show package status (all if omitted)
+#   deploy log     <name>             Show recent log entries
+#   deploy list                       List all installed packages
+#   deploy bundle  <bundle.json>      Install all packages listed in bundle file
+#
+# Registry:  /var/lib/deploy/registry.json
+# Packages:  /var/lib/deploy/packages/<name>/
+# Logs:      /var/log/deploy/<name>.log
+
+import sys
+import os
+import re
+import json
+import subprocess
+import shutil
+import datetime
+import urllib.request
+from pathlib import Path
+
+# == Repository ================================================================
+# URL of this tool's own source repository.
+# Change this when forking or maintaining your own distribution.
+
+DEPLOY_REPO_URL      = "https://raw.githubusercontent.com/ernolf/deploy_test/main"
+DEPLOY_INSTALL_BIN   = Path("/usr/local/bin/deploy")
+MKDEPLOY_INSTALL_BIN = Path("/usr/local/bin/mkdeploy")
+
+# == Paths =====================================================================
+
+DEPLOY_HOME  = Path("/var/lib/deploy")
+PACKAGES_DIR = DEPLOY_HOME / "packages"
+REGISTRY     = DEPLOY_HOME / "registry.json"
+LOG_DIR      = Path("/var/log/deploy")
+LIB_DIR      = DEPLOY_HOME / "lib"
+OS_LIB       = LIB_DIR / "os-lib.sh"
+
+# == OS Detection ==============================================================
+# Reads /etc/os-release (with /usr/lib/os-release as fallback) and detects
+# the active package manager. Results are stored in OS_CTX and exported to
+# all deploy.sh subprocesses as DEPLOY_* environment variables.
+
+def _detect_os() -> dict:
+    fields: dict[str, str] = {}
+
+    for path in ("/etc/os-release", "/usr/lib/os-release"):
+        if os.path.isfile(path):
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if "=" in line and not line.startswith("#"):
+                        key, _, val = line.partition("=")
+                        fields[key] = val.strip('"').strip("'")
+            break
+
+    deploy_os = fields.get("ID", "unknown")
+    # Arch Linux is a rolling release with no VERSION_ID — use BUILD_ID as fallback.
+    deploy_os_version = fields.get("VERSION_ID", fields.get("BUILD_ID", "unknown"))
+    # ID_LIKE is space-separated: "ubuntu debian", "rhel centos fedora", etc.
+    # Keep the full string for substring matching: "debian" in os_family.
+    deploy_os_family = fields.get("ID_LIKE", fields.get("ID", "unknown"))
+
+    result = subprocess.run(["uname", "-m"], capture_output=True, text=True)
+    deploy_arch = result.stdout.strip() or "unknown"
+
+    # ALT Linux (ID=altlinux) ships apt-get (APT-RPM) but packages are .rpm —
+    # dpkg does not exist there. Check OS identity before binary presence.
+    # Check dnf before yum — RHEL-family systems often ship a yum compat shim.
+    if deploy_os == "altlinux":
+        deploy_pkg_manager = "apt-rpm"
+    elif shutil.which("apt-get"):
+        deploy_pkg_manager = "apt"
+    elif shutil.which("dnf"):
+        deploy_pkg_manager = "dnf"
+    elif shutil.which("yum"):
+        deploy_pkg_manager = "yum"
+    elif shutil.which("zypper"):
+        deploy_pkg_manager = "zypper"
+    elif shutil.which("apk"):
+        deploy_pkg_manager = "apk"
+    elif shutil.which("pacman"):
+        deploy_pkg_manager = "pacman"
+    else:
+        deploy_pkg_manager = "unknown"
+
+    return {
+        "OS":          deploy_os,
+        "OS_VERSION":  deploy_os_version,
+        "OS_FAMILY":   deploy_os_family,
+        "ARCH":        deploy_arch,
+        "PKG_MANAGER": deploy_pkg_manager,
+    }
+
+
+OS_CTX = _detect_os()
+
+
+def _os_env() -> dict:
+    """Build the environment dict that is exported to deploy.sh subprocesses."""
+    env = os.environ.copy()
+    env["DEPLOY_OS"]          = OS_CTX["OS"]
+    env["DEPLOY_OS_VERSION"]  = OS_CTX["OS_VERSION"]
+    env["DEPLOY_OS_FAMILY"]   = OS_CTX["OS_FAMILY"]
+    env["DEPLOY_ARCH"]        = OS_CTX["ARCH"]
+    env["DEPLOY_PKG_MANAGER"] = OS_CTX["PKG_MANAGER"]
+    env["DEPLOY_LIB"]         = str(LIB_DIR)
+    return env
+
+
+# == Output helpers ============================================================
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"deploy: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def info(msg: str) -> None:
+    print(f"deploy: {msg}")
+
+def warn(msg: str) -> None:
+    print(f"deploy: warning: {msg}", file=sys.stderr)
+
+def step(msg: str) -> None:
+    print(f"\n── {msg} ──")
+
+
+# == Preflight checks ==========================================================
+
+def require_root(hint: str = "") -> None:
+    if os.getuid() != 0:
+        suffix = f" {hint}" if hint else ""
+        die(f"This command must be run as root. Try: sudo deploy{suffix}")
+
+def require_git() -> None:
+    if not shutil.which("git"):
+        info("Installing git ...")
+        _pm_install(["git"])
+
+
+# == Package Manager Abstraction ===============================================
+
+def _pm_install(packages: list) -> None:
+    """Install packages via the detected package manager."""
+    mgr = OS_CTX["PKG_MANAGER"]
+    cmd_map = {
+        "apt":    ["apt-get", "install", "-y"],
+        "dnf":    ["dnf",     "install", "-y"],
+        "yum":    ["yum",     "install", "-y"],
+        "zypper": ["zypper",  "install", "-y"],
+        "apk":    ["apk",     "add"],
+        "pacman": ["pacman",  "-S", "--noconfirm"],
+    }
+    if mgr not in cmd_map:
+        die(f"Unsupported package manager '{mgr}'. Install manually: {' '.join(packages)}")
+    subprocess.run(cmd_map[mgr] + packages, check=True)
+
+
+def _pm_is_installed(pkg: str) -> bool:
+    """Return True if the named package is currently installed."""
+    mgr = OS_CTX["PKG_MANAGER"]
+    try:
+        if mgr == "apt":
+            result = subprocess.run(
+                ["dpkg", "-l", pkg], capture_output=True, text=True
+            )
+            return any(line.startswith("ii") for line in result.stdout.splitlines())
+        elif mgr in ("dnf", "yum", "zypper"):
+            return subprocess.run(["rpm", "-q", pkg], capture_output=True).returncode == 0
+        elif mgr == "apk":
+            return subprocess.run(["apk", "info", "-e", pkg], capture_output=True).returncode == 0
+        elif mgr == "pacman":
+            return subprocess.run(["pacman", "-Q", pkg], capture_output=True).returncode == 0
+        else:
+            return shutil.which(pkg) is not None
+    except FileNotFoundError:
+        return False
+
+
+# == OS Library Installation ===================================================
+
+def _install_os_lib() -> None:
+    """Copy os-lib.sh to the deploy library directory.
+
+    Looks for os-lib.sh in the same directory as this script. If not found,
+    writes a minimal stub so packages that source it do not fail.
+    """
+    LIB_DIR.mkdir(parents=True, exist_ok=True)
+    script_dir = Path(__file__).resolve().parent
+    src = script_dir / "os-lib.sh"
+
+    if src.is_file():
+        if not OS_LIB.is_file() or src.read_bytes() != OS_LIB.read_bytes():
+            shutil.copy2(src, OS_LIB)
+            OS_LIB.chmod(0o644)
+    elif not OS_LIB.is_file():
+        stub = (
+            "# os-lib.sh stub — full version not found next to deploy binary.\n"
+            "# Re-install deploy from its source directory to get the full library.\n"
+            '[[ -z "${DEPLOY_PKG_MANAGER:-}" ]] && DEPLOY_PKG_MANAGER="unknown"\n'
+            'pm_install()      { echo "os-lib: pm_install not available (stub)" >&2; return 1; }\n'
+            'pm_is_installed() { return 1; }\n'
+            'pm_update_cache() { return 0; }\n'
+        )
+        OS_LIB.write_text(stub)
+        OS_LIB.chmod(0o644)
+        warn(f"os-lib.sh not found next to deploy binary. A stub was written to {OS_LIB}.")
+        warn("Run 'sudo deploy me' to fully install deploy and its library.")
+
+
+def _check_environment() -> None:
+    """Warn if deploy has not been installed via 'deploy me'.
+
+    Checks that the binary is in PATH and os-lib.sh is a real file (not a stub).
+    Only warns — does not abort — so deploy still works when run directly from
+    a checkout or a temporary location.
+    """
+    if not DEPLOY_INSTALL_BIN.is_file():
+        warn(f"deploy is not installed at {DEPLOY_INSTALL_BIN}.")
+        warn("Run 'sudo deploy me' to install it properly.")
+
+    if OS_LIB.is_file():
+        content = OS_LIB.read_text()
+        if "stub" in content:
+            warn(f"os-lib.sh at {OS_LIB} is a stub, not the full library.")
+            warn("Run 'sudo deploy me' to install the complete version.")
+    elif not OS_LIB.is_file():
+        warn(f"os-lib.sh not found at {OS_LIB}.")
+        warn("Run 'sudo deploy me' to install it.")
+
+
+def _download(url: str, dest: Path) -> None:
+    """Download a file from url and save it to dest."""
+    try:
+        urllib.request.urlretrieve(url, str(dest))
+    except Exception as e:
+        die(f"Download failed: {url}\n  {e}")
+
+
+# == Registry ==================================================================
+
+def _registry_init() -> None:
+    """Create the deploy directory structure and initialize an empty registry."""
+    DEPLOY_HOME.mkdir(parents=True, exist_ok=True)
+    PACKAGES_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _install_os_lib()
+    if not REGISTRY.is_file():
+        REGISTRY.write_text(json.dumps({"version": 1, "packages": {}}, indent=2) + "\n")
+
+
+def _registry_load() -> dict:
+    if not REGISTRY.is_file():
+        return {"version": 1, "packages": {}}
+    with open(REGISTRY) as f:
+        return json.load(f)
+
+
+def _registry_save(data: dict) -> None:
+    tmp = REGISTRY.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    tmp.replace(REGISTRY)
+
+
+def _registry_get(name: str, field: str = None):
+    pkg = _registry_load()["packages"].get(name)
+    if pkg is None:
+        return None
+    return pkg.get(field) if field else pkg
+
+
+def _registry_add(name: str, gist: str, version: str, description: str, path: Path) -> None:
+    data = _registry_load()
+    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    data["packages"][name] = {
+        "name":         name,
+        "origin":       gist,
+        "version":      version,
+        "description":  description,
+        "path":         str(path),
+        "installed_at": now,
+        "updated_at":   now,
+    }
+    _registry_save(data)
+
+
+def _registry_remove(name: str) -> None:
+    data = _registry_load()
+    data["packages"].pop(name, None)
+    _registry_save(data)
+
+
+def _registry_touch(name: str) -> None:
+    data = _registry_load()
+    if name in data["packages"]:
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        data["packages"][name]["updated_at"] = now
+        _registry_save(data)
+
+
+def _registry_update_version(name: str, version: str) -> None:
+    data = _registry_load()
+    if name in data["packages"]:
+        data["packages"][name]["version"] = version
+        _registry_save(data)
+
+
+def _registry_names() -> list:
+    return list(_registry_load()["packages"].keys())
+
+
+def _registry_is_installed(name: str) -> bool:
+    pkg = _registry_get(name)
+    if not pkg:
+        return False
+    path = pkg.get("path")
+    return bool(path) and Path(path).is_dir()
+
+
+# == Platform definitions ======================================================
+# Each platform knows how to recognise an argument (short ID or URL pattern)
+# and how to turn it into a clonable git URL.
+#
+# To add a new platform: append a _Platform entry to PLATFORMS. Order matters —
+# the first match wins, so more specific entries must come before generic ones.
+
+class _Platform:
+    def __init__(self, id, name, description,
+                 id_regex=None, url_contains=None,
+                 base_clone_url=None, examples=None):
+        self.id             = id
+        self.name           = name
+        self.description    = description
+        self.id_regex       = id_regex          # regex for short IDs (no URL)
+        self.url_contains   = url_contains or []
+        self.base_clone_url = base_clone_url    # prepended to short IDs
+        self.examples       = examples or []
+
+    def can_handle(self, arg: str) -> bool:
+        if self.id_regex and re.fullmatch(self.id_regex, arg):
+            return True
+        return any(s in arg for s in self.url_contains)
+
+    def to_clone_url(self, arg: str) -> str:
+        if self.id_regex and re.fullmatch(self.id_regex, arg):
+            return f"{self.base_clone_url}/{arg}.git"
+        return arg if arg.endswith(".git") else arg + ".git"
+
+
+PLATFORMS = [
+    _Platform(
+        id             = "github-gist",
+        name           = "GitHub Gist",
+        description    = "Short Gist ID or full gist.github.com URL",
+        id_regex       = r"[0-9a-f]{20,}",
+        url_contains   = ["gist.github.com"],
+        base_clone_url = "https://gist.github.com",
+        examples       = [
+            "deploy install 8d16744998afffeb8abb67c41bf29f73",
+            "deploy install https://gist.github.com/ernolf/8d16744998afffeb8abb67c41bf29f73",
+        ],
+    ),
+    _Platform(
+        id           = "github-repo",
+        name         = "GitHub Repository",
+        description  = "Public or authenticated private GitHub repository",
+        url_contains = ["github.com/"],
+        examples     = [
+            "deploy install https://github.com/user/repo",
+        ],
+    ),
+    _Platform(
+        id           = "codeberg",
+        name         = "Codeberg",
+        description  = "Codeberg repository (codeberg.org)",
+        url_contains = ["codeberg.org/"],
+        examples     = [
+            "deploy install https://codeberg.org/user/repo",
+        ],
+    ),
+    _Platform(
+        id           = "git",
+        name         = "Generic Git",
+        description  = "Any publicly accessible Git repository",
+        url_contains = ["https://", "http://", "git@", "git://"],
+        examples     = [
+            "deploy install https://example.com/user/repo.git",
+        ],
+    ),
+]
+
+
+def _resolve_platform(arg: str) -> tuple:
+    """Return (platform, clone_url) for the given argument, or die."""
+    for p in PLATFORMS:
+        if p.can_handle(arg):
+            return p, p.to_clone_url(arg)
+    die(
+        f"Cannot determine platform for: '{arg}'\n"
+        "  Provide a short Gist ID, a full repository URL,\n"
+        "  or run 'deploy platforms' to see supported formats."
+    )
+
+
+# == Package helpers ===========================================================
+
+def _pkg_clone(pkg_ref: str, dest: Path) -> None:
+    _platform, clone_url = _resolve_platform(pkg_ref)
+    subprocess.run(
+        ["git", "clone", clone_url, str(dest)],
+        check=True,
+    )
+
+
+def _pkg_pull(path: Path) -> bool:
+    return subprocess.run(["git", "-C", str(path), "pull", "--ff-only"]).returncode == 0
+
+
+def _pkg_read_manifest(path: Path) -> dict:
+    manifest = path / "manifest.json"
+    if not manifest.is_file():
+        die(f"manifest.json not found in: {path}")
+    with open(manifest) as f:
+        return json.load(f)
+
+
+def _pkg_requires_root(path: Path) -> bool:
+    try:
+        return bool(_pkg_read_manifest(path).get("requires_root", False))
+    except SystemExit:
+        return False
+
+
+def _pkg_log_path(name: str) -> Path:
+    return LOG_DIR / f"{name}.log"
+
+
+def _pkg_install_deps(pkg_path: Path) -> None:
+    """Install packages declared in manifest.json dependencies[<pkg-manager>]."""
+    manifest_path = pkg_path / "manifest.json"
+    if not manifest_path.is_file():
+        return
+
+    manifest = json.loads(manifest_path.read_text())
+    mgr = OS_CTX["PKG_MANAGER"]
+    pkgs = manifest.get("dependencies", {}).get(mgr, [])
+
+    if not pkgs:
+        return
+
+    missing = [p for p in pkgs if not _pm_is_installed(p)]
+    if not missing:
+        return
+
+    info(f"Installing {len(missing)} missing package dependency/dependencies "
+         f"via {mgr}: {' '.join(missing)}")
+    _pm_install(missing)
+
+
+def _pkg_run(name: str, action: str, path: Path) -> int:
+    """Run deploy.sh <action> with DEPLOY_* environment variables exported.
+
+    For 'status': output goes directly to stdout, not logged.
+    For all other actions: output is tee'd to both terminal and the package log.
+    """
+    deploy_sh = path / "deploy.sh"
+    if not deploy_sh.is_file():
+        die(f"deploy.sh not found in: {path}")
+
+    if not os.access(deploy_sh, os.X_OK):
+        deploy_sh.chmod(deploy_sh.stat().st_mode | 0o111)
+
+    env = _os_env()
+
+    if action == "status":
+        return subprocess.run([str(deploy_sh), action], env=env).returncode
+
+    logfile = _pkg_log_path(name)
+    with open(logfile, "a") as log:
+        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        log.write(f"─── deploy {action} {name} | {ts} ───\n")
+        log.flush()
+
+        proc = subprocess.Popen(
+            [str(deploy_sh), action],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            log.write(line)
+        proc.wait()
+
+    return proc.returncode
+
+
+# == Command: me ===============================================================
+
+def _ask_yes_no(prompt: str) -> bool:
+    """Prompt for a yes/no answer, defaulting to no."""
+    try:
+        return input(f"{prompt} [y/N]: ").strip().lower() in ("y", "yes")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+
+def _offer_cleanup(self_path: Path, used_local_lib: bool) -> None:
+    """Offer to delete source files used during installation.
+
+    Called after a successful 'deploy me' when the source is not already
+    the installed binary. Detects three cases:
+      - git clone: offer to delete the entire cloned directory
+      - loose files: offer to delete the script (and os-lib.sh if it was local)
+    """
+    src_dir  = self_path.parent
+    is_clone = (src_dir / ".git").is_dir()
+
+    print()
+    if is_clone:
+        print(f"deploy: Cleanup: this looks like a git clone.")
+        print(f"         {src_dir}/")
+        print(f"         The directory is no longer needed — deploy is installed")
+        print(f"         at {DEPLOY_INSTALL_BIN}.")
+        print(f"         To update deploy in the future, simply run: deploy update me")
+        if _ask_yes_no("         Delete the entire directory?"):
+            shutil.rmtree(src_dir)
+            info(f"Deleted: {src_dir}/")
+        else:
+            info("Skipped. You can delete it manually at any time.")
+    else:
+        to_delete = [self_path]
+        if used_local_lib:
+            local_lib = src_dir / "os-lib.sh"
+            if local_lib.is_file() and local_lib != OS_LIB:
+                to_delete.append(local_lib)
+        local_mkdeploy = src_dir / "mkdeploy"
+        if local_mkdeploy.is_file() and local_mkdeploy != MKDEPLOY_INSTALL_BIN:
+            to_delete.append(local_mkdeploy)
+
+        if len(to_delete) == 1:
+            print(f"deploy: Cleanup: {to_delete[0]} is no longer needed.")
+        else:
+            print("deploy: Cleanup: these files are no longer needed:")
+            for f in to_delete:
+                print(f"           {f}")
+
+        if _ask_yes_no("         Delete?"):
+            for f in to_delete:
+                if f.exists():
+                    f.unlink()
+                    info(f"Deleted: {f}")
+        else:
+            info("Skipped. You can delete them manually at any time.")
+
+
+def cmd_me() -> None:
+    """Install deploy itself: binary to /usr/local/bin, os-lib.sh to the lib
+    directory, and initialize the directory structure.
+
+    Run once as root after copying deploy to any location. Safe to re-run.
+    """
+    require_root("me")
+
+    info("Setting up deploy environment ...")
+
+    # Directories
+    for d in (DEPLOY_HOME, PACKAGES_DIR, LOG_DIR, LIB_DIR):
+        d.mkdir(parents=True, exist_ok=True)
+
+    self_path      = Path(__file__).resolve()
+    used_local_lib = False
+
+    # Binary
+    if self_path != DEPLOY_INSTALL_BIN:
+        info(f"Installing deploy → {DEPLOY_INSTALL_BIN}")
+        shutil.copy2(self_path, DEPLOY_INSTALL_BIN)
+    DEPLOY_INSTALL_BIN.chmod(0o755)
+
+    # os-lib.sh — prefer local copy next to the script, fall back to download
+    local_lib = self_path.parent / "os-lib.sh"
+    if local_lib.is_file():
+        info(f"Installing os-lib.sh from local copy → {OS_LIB}")
+        shutil.copy2(local_lib, OS_LIB)
+        used_local_lib = True
+    else:
+        info(f"Downloading os-lib.sh from {DEPLOY_REPO_URL} ...")
+        _download(f"{DEPLOY_REPO_URL}/os-lib.sh", OS_LIB)
+    OS_LIB.chmod(0o644)
+
+    # mkdeploy — install if found locally, otherwise download
+    local_mkdeploy = self_path.parent / "mkdeploy"
+    if local_mkdeploy.is_file():
+        info(f"Installing mkdeploy from local copy → {MKDEPLOY_INSTALL_BIN}")
+        shutil.copy2(local_mkdeploy, MKDEPLOY_INSTALL_BIN)
+    else:
+        info(f"Downloading mkdeploy from {DEPLOY_REPO_URL} ...")
+        _download(f"{DEPLOY_REPO_URL}/mkdeploy", MKDEPLOY_INSTALL_BIN)
+    MKDEPLOY_INSTALL_BIN.chmod(0o755)
+
+    # Registry
+    if not REGISTRY.is_file():
+        REGISTRY.write_text(json.dumps({"version": 1, "packages": {}}, indent=2) + "\n")
+
+    info("Done. deploy is ready — run 'deploy --help' to get started.")
+
+    # Offer to clean up source files — only possible right now, while we still
+    # know where we were called from. After installation this information is gone.
+    if self_path != DEPLOY_INSTALL_BIN:
+        _offer_cleanup(self_path, used_local_lib)
+
+
+# == Command: update me ========================================================
+
+def cmd_update_me() -> None:
+    """Update deploy itself and os-lib.sh from the configured repository URL."""
+    require_root("update me")
+
+    info(f"Fetching latest deploy from {DEPLOY_REPO_URL} ...")
+    tmp_bin = DEPLOY_INSTALL_BIN.with_suffix(".tmp")
+    _download(f"{DEPLOY_REPO_URL}/deploy", tmp_bin)
+    tmp_bin.chmod(0o755)
+    tmp_bin.replace(DEPLOY_INSTALL_BIN)
+    info(f"deploy updated → {DEPLOY_INSTALL_BIN}")
+
+    LIB_DIR.mkdir(parents=True, exist_ok=True)
+    info("Fetching latest os-lib.sh ...")
+    _download(f"{DEPLOY_REPO_URL}/os-lib.sh", OS_LIB)
+    OS_LIB.chmod(0o644)
+    info(f"os-lib.sh updated → {OS_LIB}")
+
+    info("Fetching latest mkdeploy ...")
+    _download(f"{DEPLOY_REPO_URL}/mkdeploy", MKDEPLOY_INSTALL_BIN)
+    MKDEPLOY_INSTALL_BIN.chmod(0o755)
+    info(f"mkdeploy updated → {MKDEPLOY_INSTALL_BIN}")
+
+    info("All tools are up to date.")
+
+
+# == Command: inspect ==========================================================
+
+def cmd_inspect(ref: str) -> None:
+    """Clone a package to a temp directory, show its manifest and deploy.sh, then clean up."""
+    if not ref:
+        die("Usage: deploy inspect <gist-id|url>")
+
+    require_git()
+
+    tmp_dir = PACKAGES_DIR / f".inspect-{ref[:40]}"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+
+    platform, _ = _resolve_platform(ref)
+    info(f"Fetching via {platform.name}: {ref} ...")
+    try:
+        _pkg_clone(ref, tmp_dir)
+    except subprocess.CalledProcessError:
+        die(f"git clone failed: {ref}")
+
+    try:
+        manifest = _pkg_read_manifest(tmp_dir)
+        name        = manifest.get("name",        "(unknown)")
+        version     = manifest.get("version",     "(unknown)")
+        description = manifest.get("description", "")
+        author      = manifest.get("author",      "")
+        root_req    = manifest.get("requires_root", False)
+        deps        = manifest.get("dependencies", {})
+
+        print()
+        print(f"  Package:      {name}")
+        print(f"  Version:      {version}")
+        print(f"  Description:  {description}")
+        if author:
+            print(f"  Author:       {author}")
+        print(f"  Requires root: {'yes' if root_req else 'no'}")
+        if deps:
+            for mgr, pkgs in deps.items():
+                if pkgs:
+                    print(f"  deps ({mgr}):   {' '.join(pkgs)}")
+
+        deploy_sh = tmp_dir / "deploy.sh"
+        if deploy_sh.is_file():
+            print()
+            print("  ── deploy.sh " + "─" * 55)
+            for line in deploy_sh.read_text().splitlines():
+                print(f"  {line}")
+            print("  " + "─" * 67)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# == Command: install ==========================================================
+
+def cmd_install(ref: str, yes: bool = False) -> None:
+    if not ref:
+        die("Usage: deploy install <gist-id|url> [--yes]")
+
+    require_git()
+    _registry_init()
+
+    tmp_dir = PACKAGES_DIR / f".tmp-{ref[:40]}"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+
+    platform, _ = _resolve_platform(ref)
+    info(f"Cloning via {platform.name}: {ref} ...")
+    try:
+        _pkg_clone(ref, tmp_dir)
+    except subprocess.CalledProcessError:
+        die(f"git clone failed: {ref}")
+
+    manifest    = _pkg_read_manifest(tmp_dir)
+    name        = manifest.get("name")
+    version     = manifest.get("version", "unknown")
+    description = manifest.get("description", "")
+    author      = manifest.get("author", "")
+    root_req    = manifest.get("requires_root", False)
+    deps        = manifest.get("dependencies", {})
+
+    if not name:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        die(f"manifest.json is missing the 'name' field in: {ref}")
+
+    if root_req:
+        require_root(f"install {ref}")
+
+    if _registry_is_installed(name):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        warn(f"Package '{name}' is already installed.")
+        info(f"To update: deploy update {name}")
+        sys.exit(1)
+
+    # Show package info and ask for confirmation unless --yes was passed.
+    if not yes:
+        print()
+        print(f"  Package:      {name}")
+        print(f"  Version:      {version}")
+        print(f"  Description:  {description}")
+        if author:
+            print(f"  Author:       {author}")
+        print(f"  Requires root: {'yes' if root_req else 'no'}")
+        active_deps = {m: p for m, p in deps.items() if p}
+        if active_deps:
+            for mgr, pkgs in active_deps.items():
+                print(f"  deps ({mgr}):   {' '.join(pkgs)}")
+        print()
+        try:
+            answer = input("  Proceed with installation? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            info("Aborted.")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            sys.exit(0)
+        if answer not in ("y", "yes"):
+            info("Aborted.")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            sys.exit(0)
+
+    pkg_path = PACKAGES_DIR / name
+    if pkg_path.exists():
+        shutil.rmtree(pkg_path)
+    tmp_dir.rename(pkg_path)
+
+    step(f"Installing {name} {version} ({OS_CTX['OS']}/{OS_CTX['PKG_MANAGER']}) via {platform.name}")
+    _pkg_install_deps(pkg_path)
+
+    rc = _pkg_run(name, "install", pkg_path)
+    if rc != 0:
+        _registry_remove(name)
+        die(f"deploy.sh install failed for '{name}'. See: deploy log {name}")
+
+    _registry_add(name, ref, version, description, pkg_path)
+    info(f"Package '{name}' {version} installed successfully.")
+
+
+# == Command: remove ===========================================================
+
+def cmd_remove(name: str) -> None:
+    if not name:
+        die("Usage: deploy remove <name>")
+
+    _registry_init()
+
+    pkg = _registry_get(name)
+    if not pkg:
+        die(f"Package '{name}' is not installed.")
+
+    pkg_path = Path(pkg["path"])
+    if not pkg_path.is_dir():
+        die(f"Package directory missing: {pkg_path}")
+
+    if _pkg_requires_root(pkg_path):
+        require_root(f"remove {name}")
+
+    step(f"Removing {name}")
+    rc = _pkg_run(name, "remove", pkg_path)
+    if rc != 0:
+        warn("deploy.sh remove exited with an error — proceeding with deregistration.")
+
+    _registry_remove(name)
+    info(f"Package '{name}' removed from registry.")
+    info(f"Clone kept at: {pkg_path}")
+    info(f"To delete the source files: rm -rf {pkg_path}")
+
+
+# == Command: update ===========================================================
+
+def cmd_update(target: str) -> None:
+    require_git()
+    _registry_init()
+
+    if target == "--all":
+        names = _registry_names()
+    else:
+        if not _registry_is_installed(target):
+            die(f"Package '{target}' is not installed.")
+        names = [target]
+
+    if not names:
+        info("No packages installed.")
+        return
+
+    failed = 0
+    for name in names:
+        step(f"Updating {name}")
+
+        pkg = _registry_get(name)
+        if not pkg or not Path(pkg["path"]).is_dir():
+            warn(f"Skipping '{name}': path not found in registry.")
+            continue
+
+        pkg_path = Path(pkg["path"])
+
+        if _pkg_requires_root(pkg_path):
+            require_root(f"update {name}")
+
+        info("git pull ...")
+        if not _pkg_pull(pkg_path):
+            warn(f"git pull failed for '{name}' — continuing with current files.")
+
+        try:
+            new_version = _pkg_read_manifest(pkg_path).get("version", "unknown")
+        except SystemExit:
+            new_version = "unknown"
+
+        _pkg_install_deps(pkg_path)
+
+        rc = _pkg_run(name, "update", pkg_path)
+        if rc == 0:
+            _registry_touch(name)
+            _registry_update_version(name, new_version)
+            info(f"Package '{name}' updated to {new_version}.")
+        else:
+            warn(f"deploy.sh update failed for '{name}'. See: deploy log {name}")
+            failed += 1
+
+    if failed:
+        die(f"{failed} package(s) failed to update.")
+
+
+# == Command: status ===========================================================
+
+def cmd_status(name: str) -> None:
+    _registry_init()
+
+    if name:
+        pkg = _registry_get(name)
+        if not pkg:
+            die(f"Package '{name}' is not installed.")
+        _pkg_run(name, "status", Path(pkg["path"]))
+    else:
+        names = _registry_names()
+        if not names:
+            info("No packages installed.")
+            return
+        for n in names:
+            pkg = _registry_get(n)
+            if not pkg or not Path(pkg["path"]).is_dir():
+                continue
+            print(f"── {n} ──")
+            _pkg_run(n, "status", Path(pkg["path"]))
+            print()
+
+
+# == Command: log ==============================================================
+
+def cmd_log(name: str) -> None:
+    if not name:
+        die("Usage: deploy log <name>")
+
+    logfile = _pkg_log_path(name)
+    if not logfile.is_file():
+        die(f"No log found for '{name}': {logfile}")
+
+    lines = logfile.read_text().splitlines()
+    if sys.stdout.isatty():
+        lines = lines[-60:]
+    print("\n".join(lines))
+
+
+# == Command: list =============================================================
+
+def cmd_list() -> None:
+    _registry_init()
+    names = _registry_names()
+
+    if not names:
+        info("No packages installed.")
+        return
+
+    print(f"{'NAME':<28} {'VERSION':<8} {'GIST':<38} UPDATED")
+    print(f"{'─' * 28} {'─' * 8} {'─' * 38} {'─' * 23}")
+    for name in names:
+        pkg = _registry_get(name)
+        print(
+            f"{pkg.get('name', ''):<28} "
+            f"{pkg.get('version', ''):<8} "
+            f"{pkg.get('gist', ''):<38} "
+            f"{pkg.get('updated_at', '')}"
+        )
+
+
+# == Command: bundle ===========================================================
+
+def cmd_bundle(bundle_file: str) -> None:
+    if not bundle_file:
+        die("Usage: deploy bundle <bundle.json>")
+
+    bundle_path = Path(bundle_file)
+    if not bundle_path.is_file():
+        die(f"Bundle file not found: {bundle_file}")
+
+    require_root(f"bundle {bundle_file}")
+
+    with open(bundle_path) as f:
+        bundle = json.load(f)
+
+    description = bundle.get("description", "unnamed bundle")
+    # Accept "origin" and legacy keys "source" / "gist"
+    refs = [p.get("origin") or p.get("source") or p.get("gist")
+            for p in bundle.get("packages", [])
+            if  p.get("origin") or p.get("source") or p.get("gist")]
+
+    if not refs:
+        die("No packages found in bundle file.")
+
+    info(f"Bundle: {description}")
+    info(f"Installing {len(refs)} package(s) on {OS_CTX['OS']}/{OS_CTX['PKG_MANAGER']} ...")
+
+    failed = 0
+    for ref in refs:
+        try:
+            cmd_install(ref)
+        except SystemExit as e:
+            if e.code != 0:
+                warn(f"Failed to install: {ref}")
+                failed += 1
+
+    print()
+    if failed == 0:
+        info("Bundle installation complete. All packages installed.")
+    else:
+        die(f"Bundle installation finished with {failed} failure(s).")
+
+
+# == Command: platforms ========================================================
+
+def cmd_platforms() -> None:
+    """List all supported package source platforms."""
+    print("Supported platforms:\n")
+    for p in PLATFORMS:
+        print(f"  {p.id:<16} {p.name}")
+        print(f"  {'':<16} {p.description}")
+        for ex in p.examples:
+            print(f"  {'':<16} {ex}")
+        print()
+
+
+# == Usage =====================================================================
+
+def usage() -> None:
+    print(f"""\
+deploy — personal package manager for gist-based mini-packages
+         OS: {OS_CTX['OS']} {OS_CTX['OS_VERSION']} ({OS_CTX['ARCH']}) | pkg: {OS_CTX['PKG_MANAGER']}
+
+Usage:
+  deploy me                         Install deploy itself (run once as root)
+  deploy inspect <ref>              Show package info and deploy.sh without installing
+  deploy install <ref> [--yes]      Clone and install a package
+  deploy remove  <name>             Remove package (keeps clone)
+  deploy update  me                 Update deploy itself from the repository
+  deploy update  [<name>|--all]     git pull + re-run deploy.sh update
+  deploy status  [<name>]           Show status (all packages if omitted)
+  deploy log     <name>             Show recent log (last 60 lines)
+  deploy list                       List all installed packages
+  deploy bundle  <bundle.json>      Install all packages from bundle file
+  deploy platforms                  List supported package source platforms
+
+  <ref> is a short Gist ID, or a full URL for any other platform.
+  Run 'deploy platforms' to see all supported formats.
+  Use '--yes' to skip the confirmation prompt (for scripts/automation).
+
+Options:
+  -h, --help    Show this help
+
+Registry:  /var/lib/deploy/registry.json
+Packages:  /var/lib/deploy/packages/
+Logs:      /var/log/deploy/
+OS lib:    /var/lib/deploy/lib/os-lib.sh
+Repo:      {DEPLOY_REPO_URL}""")
+
+
+# == Entry point ===============================================================
+
+def main() -> None:
+    args = sys.argv[1:]
+    cmd  = args[0] if args else ""
+    arg2 = args[1] if len(args) > 1 else ""
+
+    # Self-installation commands do not require a working environment.
+    if cmd in ("-h", "--help", "help", ""):
+        usage()
+        return
+    if cmd == "me":
+        cmd_me()
+        return
+    if cmd == "update" and arg2 == "me":
+        cmd_update_me()
+        return
+
+    # All other commands: warn if deploy hasn't been installed via 'deploy me'.
+    _check_environment()
+
+    if   cmd == "inspect": cmd_inspect(arg2)
+    elif cmd == "install": cmd_install(arg2, yes="--yes" in args)
+    elif cmd == "remove":  cmd_remove(arg2)
+    elif cmd == "update":  cmd_update(arg2 or "--all")
+    elif cmd == "status":  cmd_status(arg2)
+    elif cmd == "log":     cmd_log(arg2)
+    elif cmd == "list":    cmd_list()
+    elif cmd == "bundle":    cmd_bundle(arg2)
+    elif cmd == "platforms": cmd_platforms()
+    else:
+        die(f"Unknown command: '{cmd}'. Run 'deploy --help'.")
+
+
+if __name__ == "__main__":
+    main()

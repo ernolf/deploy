@@ -1,0 +1,426 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 [ernolf] Raphael Gradenwitz
+# SPDX-License-Identifier: MIT
+#
+# mkdeploy — package authoring tool for the Mini-Deploy ecosystem
+#
+# Creates and publishes gist-based deploy packages.
+#
+# Usage:
+#   mkdeploy init              Create a new package skeleton in the current directory
+#   mkdeploy create            Publish current directory as a new GitHub Gist
+#   mkdeploy push              Update the existing Gist for this package
+#   mkdeploy auth              Configure GitHub token
+
+import sys
+import os
+import json
+import subprocess
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+# == Repository ================================================================
+# Must match the DEPLOY_REPO_URL in the deploy script.
+
+DEPLOY_REPO_URL = "https://raw.githubusercontent.com/ernolf/deploy_test/main"
+
+# == Paths =====================================================================
+
+DEPLOY_CONFIG_DIR = Path.home() / ".config" / "deploy"
+TOKEN_FILE        = DEPLOY_CONFIG_DIR / "github_token"
+
+# == deploy.sh template ========================================================
+# Uses __NAME__ and __SEP__ as placeholders to avoid f-string / bash brace
+# conflicts. Substituted in cmd_init().
+
+_DEPLOY_SH_TEMPLATE = """\
+#!/usr/bin/env bash
+# __NAME__ deploy script
+#
+# Conforms to the Mini-Deploy Package Standard.
+# Actions: install | remove | status | update
+
+set -euo pipefail
+
+PACKAGE_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=/var/lib/deploy/lib/os-lib.sh
+. "${DEPLOY_LIB}/os-lib.sh"
+
+# == Helpers ===================================================================
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+die() { log "ERROR: $*" >&2; exit 1; }
+ok()  { echo "  ✓ $*"; }
+nok() { echo "  ✗ $*"; }
+
+# == Actions ===================================================================
+
+case "${1:-}" in
+    install)
+        log "Installing __NAME__ ..."
+        # TODO: implement install
+        ;;
+
+    remove)
+        log "Removing __NAME__ ..."
+        # TODO: implement remove
+        ;;
+
+    status)
+        echo "__NAME__ status"
+        echo "__SEP__"
+        # TODO: implement status checks
+        echo ""
+        echo "Overall: OK"
+        exit 0
+        ;;
+
+    update)
+        log "Updating __NAME__ ..."
+        # TODO: implement update
+        ;;
+
+    *)
+        echo "Usage: $(basename "$0") <install|remove|status|update>" >&2
+        exit 1
+        ;;
+esac
+"""
+
+# == Output helpers ============================================================
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"mkdeploy: error: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def info(msg: str) -> None:
+    print(f"mkdeploy: {msg}")
+
+def warn(msg: str) -> None:
+    print(f"mkdeploy: warning: {msg}", file=sys.stderr)
+
+def step(msg: str) -> None:
+    print(f"\n── {msg} ──")
+
+
+# == GitHub Token resolution ===================================================
+
+def _git_credential_token() -> str:
+    """Retrieve GitHub token via the configured git credential helper."""
+    try:
+        result = subprocess.run(
+            ["git", "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if line.startswith("password="):
+                return line.partition("=")[2]
+    except Exception:
+        pass
+    return None
+
+
+def _get_token() -> str:
+    """Return a GitHub token, trying several sources in order:
+      1. GITHUB_TOKEN / GH_TOKEN environment variable
+      2. git credential helper (github.com)
+      3. ~/.config/deploy/github_token
+    """
+    token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if token:
+        return token
+
+    token = _git_credential_token()
+    if token:
+        return token
+
+    if TOKEN_FILE.is_file():
+        token = TOKEN_FILE.read_text().strip()
+        if token:
+            return token
+
+    die(
+        "No GitHub token found.\n"
+        "  Options:\n"
+        "    mkdeploy auth              — store a token interactively\n"
+        "    export GITHUB_TOKEN=...    — pass via environment\n"
+        "    Configure git credentials for github.com"
+    )
+
+
+# == GitHub Gist API ===========================================================
+
+def _gist_request(method: str, path: str, token: str, data: dict = None) -> dict:
+    """Make a GitHub API request and return the parsed JSON response."""
+    url  = f"https://api.github.com{path}"
+    body = json.dumps(data).encode() if data else None
+    req  = urllib.request.Request(url, data=body, method=method)
+    req.add_header("Authorization",        f"Bearer {token}")
+    req.add_header("Accept",               "application/vnd.github+json")
+    req.add_header("X-GitHub-Api-Version", "2022-11-28")
+    if body:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()
+        die(f"GitHub API error {e.code}: {detail}")
+
+
+def _read_package_files(directory: Path) -> dict:
+    """Read all non-hidden text files in a directory for Gist upload.
+
+    Files starting with '.' and the .git directory are excluded.
+    Binary files are skipped with a warning.
+    """
+    files = {}
+    for f in sorted(directory.iterdir()):
+        if f.name.startswith("."):
+            continue
+        if f.is_file():
+            try:
+                files[f.name] = {"content": f.read_text()}
+            except UnicodeDecodeError:
+                warn(f"Skipping binary file: {f.name}")
+    return files
+
+
+# == Command: auth =============================================================
+
+def cmd_auth() -> None:
+    """Interactively store a GitHub Personal Access Token."""
+    print()
+    print("mkdeploy needs a GitHub Personal Access Token with 'gist' scope.")
+    print()
+    print("Create one at:")
+    print("  https://github.com/settings/tokens/new?scopes=gist&description=mkdeploy")
+    print()
+
+    try:
+        token = input("Paste your token here: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        die("Aborted.")
+
+    if not token:
+        die("No token entered.")
+
+    # Validate the token against the API before saving
+    req = urllib.request.Request("https://api.github.com/user")
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Accept",        "application/vnd.github+json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            username = json.loads(resp.read()).get("login", "unknown")
+    except urllib.error.HTTPError:
+        die("Token validation failed — check that the token is correct and has 'gist' scope.")
+
+    DEPLOY_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    TOKEN_FILE.write_text(token + "\n")
+    TOKEN_FILE.chmod(0o600)
+
+    info(f"Token saved for GitHub user '{username}'.")
+    info(f"Stored at: {TOKEN_FILE}")
+
+
+# == Command: init =============================================================
+
+def cmd_init() -> None:
+    """Create a new package skeleton (manifest.json + deploy.sh) in the current directory."""
+    cwd = Path.cwd()
+
+    for f in ("manifest.json", "deploy.sh"):
+        if (cwd / f).exists():
+            die(f"{f} already exists in this directory.")
+
+    # Detect git user for author default
+    try:
+        git_user = subprocess.run(
+            ["git", "config", "user.name"], capture_output=True, text=True
+        ).stdout.strip()
+    except Exception:
+        git_user = ""
+
+    def ask(prompt: str, default: str = "") -> str:
+        shown = f" [{default}]" if default else ""
+        try:
+            val = input(f"  {prompt}{shown}: ").strip()
+            return val if val else default
+        except (EOFError, KeyboardInterrupt):
+            print()
+            die("Aborted.")
+
+    print()
+    print("── New deploy package ──")
+    print()
+    name          = ask("Package name",        cwd.name)
+    description   = ask("Description")
+    author        = ask("Author",              git_user)
+    root_str      = ask("Requires root? (y/n)", "y")
+    requires_root = root_str.lower() in ("y", "yes", "1")
+
+    # manifest.json
+    manifest = {
+        "name":          name,
+        "version":       "1.0.0",
+        "description":   description,
+        "origin":        "",
+        "author":        author,
+        "requires_root": requires_root,
+        "dependencies": {
+            "apt":    [],
+            "dnf":    [],
+            "zypper": [],
+            "apk":    [],
+            "pacman": [],
+        },
+    }
+    (cwd / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    info("Created manifest.json")
+
+    # deploy.sh from template
+    sep     = "─" * (len(name) + 7)
+    content = _DEPLOY_SH_TEMPLATE.replace("__NAME__", name).replace("__SEP__", sep)
+    deploy_sh = cwd / "deploy.sh"
+    deploy_sh.write_text(content)
+    deploy_sh.chmod(deploy_sh.stat().st_mode | 0o111)
+    info("Created deploy.sh")
+
+    print()
+    print("  Next steps:")
+    print("  1. Edit manifest.json — fill in dependencies per package manager")
+    print("  2. Implement deploy.sh — install / remove / status / update")
+    print("  3. Run 'mkdeploy create' to publish as a GitHub Gist")
+
+
+# == Command: create ===========================================================
+
+def cmd_create(secret: bool = False) -> None:
+    """Publish the current directory as a new GitHub Gist.
+
+    By default the Gist is public. Pass secret=True to create a secret Gist
+    (not listed or indexed, but accessible to anyone who knows the ID).
+    """
+    cwd           = Path.cwd()
+    manifest_path = cwd / "manifest.json"
+
+    if not manifest_path.is_file():
+        die("No manifest.json found. Run 'mkdeploy init' first.")
+
+    manifest    = json.loads(manifest_path.read_text())
+    name        = manifest.get("name", cwd.name)
+    description = manifest.get("description", name)
+
+    if manifest.get("origin"):
+        die(
+            f"manifest.json already contains origin: {manifest['origin']}\n"
+            "  Use 'mkdeploy push' to update the existing Gist."
+        )
+
+    token = _get_token()
+    files = _read_package_files(cwd)
+
+    if not files:
+        die("No files found in current directory.")
+
+    visibility = "secret" if secret else "public"
+    step(f"Creating {visibility} Gist for '{name}'")
+    info(f"Files: {', '.join(files.keys())}")
+
+    result   = _gist_request("POST", "/gists", token, {
+        "description": description,
+        "public":      not secret,
+        "files":       files,
+    })
+    gist_id  = result["id"]
+    gist_url = result["html_url"]
+
+    # Write gist ID back into manifest.json
+    manifest["origin"] = gist_id
+    manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+
+    info(f"Gist created:  {gist_url}")
+    info(f"Gist ID:       {gist_id}")
+    info(f"manifest.json updated with gist ID.")
+    print()
+    print("  To install this package on any server:")
+    print(f"  deploy install {gist_id}")
+
+
+# == Command: push =============================================================
+
+def cmd_push() -> None:
+    """Update the existing Gist with all files from the current directory."""
+    cwd           = Path.cwd()
+    manifest_path = cwd / "manifest.json"
+
+    if not manifest_path.is_file():
+        die("No manifest.json found. Run 'mkdeploy init' first.")
+
+    manifest = json.loads(manifest_path.read_text())
+    gist_id  = manifest.get("origin") or manifest.get("source") or manifest.get("gist", "")
+    name     = manifest.get("name", cwd.name)
+
+    if not gist_id:
+        die(
+            "No gist ID in manifest.json.\n"
+            "  Run 'mkdeploy create' to publish this package as a new Gist first."
+        )
+
+    token = _get_token()
+    files = _read_package_files(cwd)
+
+    if not files:
+        die("No files found in current directory.")
+
+    step(f"Pushing '{name}' → Gist {gist_id}")
+    info(f"Files: {', '.join(files.keys())}")
+
+    result   = _gist_request("PATCH", f"/gists/{gist_id}", token, {"files": files})
+    gist_url = result["html_url"]
+
+    info(f"Gist updated: {gist_url}")
+
+
+# == Usage =====================================================================
+
+def usage() -> None:
+    print("""\
+mkdeploy — package authoring tool for the Mini-Deploy ecosystem
+
+Usage:
+  mkdeploy init                Create a new package skeleton in the current directory
+  mkdeploy create              Publish current directory as a new public GitHub Gist
+  mkdeploy create --secret     Publish as a secret Gist (not listed, but installable by ID)
+  mkdeploy push                Update the existing Gist for this package
+  mkdeploy auth                Configure GitHub token
+
+Options:
+  -h, --help    Show this help
+
+Token resolution order:
+  1. GITHUB_TOKEN or GH_TOKEN environment variable
+  2. git credential helper (github.com)
+  3. ~/.config/deploy/github_token  (set via 'mkdeploy auth')""")
+
+
+# == Entry point ===============================================================
+
+def main() -> None:
+    args = sys.argv[1:]
+    cmd  = args[0] if args else ""
+
+    if   cmd in ("-h", "--help", "help", ""): usage()
+    elif cmd == "init":   cmd_init()
+    elif cmd == "create": cmd_create(secret="--secret" in args)
+    elif cmd == "push":   cmd_push()
+    elif cmd == "auth":   cmd_auth()
+    else:
+        die(f"Unknown command: '{cmd}'. Run 'mkdeploy --help'.")
+
+
+if __name__ == "__main__":
+    main()
