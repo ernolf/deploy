@@ -1,4 +1,4 @@
-# Gist-Based Mini-Deploy Package Standard
+# Mini-Deploy Package Standard
 
 | | |
 |---|---|
@@ -21,12 +21,12 @@ carries no official status. Distribution is unlimited.
 **Abstract**
 
 This document defines a lightweight convention for packaging personal
-server configurations, scripts, and system integrations as
-self-contained deployable units — stored as GitHub Gists, managed by
-the `deploy` command-line tool. The standard covers package structure,
-the mandatory `manifest.json` schema, the `deploy.sh` lifecycle
-interface, OS environment variables, the OS abstraction library, and
-the package registry format.
+server configurations, scripts, system integrations, and AI coding
+assistant skills as self-contained deployable units — hosted on any
+public Git repository and managed by the `deploy` command-line tool.
+The standard covers package structure, the mandatory `manifest.json`
+schema, the `deploy.sh` lifecycle interface, OS environment variables,
+the OS abstraction library, and the package registry format.
 
 ---
 
@@ -59,7 +59,7 @@ usually undocumented.
 
 This standard solves that with three goals:
 
-- **One command to install anything:** `deploy install <origin>`
+- **One command to install anything:** `deploy install <gist-id|url>`
 - **One command to update everything:** `deploy update --all`
 - **Fully reproducible:** a fresh system is configured by running
   `deploy bundle server.json`
@@ -104,8 +104,8 @@ documentation says by keeping them in the same place.
 
 ## 3. Package Structure
 
-A conforming package is a git repository (typically a GitHub Gist)
-containing at minimum:
+A conforming package is a GitHub Gist or any other publicly accessible
+git repository, containing at minimum:
 
 ```
 <repo>/
@@ -114,8 +114,34 @@ containing at minimum:
 └── <other files>   — any scripts, configs, templates the package needs
 ```
 
-All files MUST live flat at the repository root. GitHub Gists do not
-support subdirectories.
+All files MUST live flat at the repository root. This ensures
+compatibility with GitHub Gists, which do not support subdirectories,
+and keeps packages simple and auditable regardless of host.
+
+### 3.1. Package Source Reference
+
+A package is identified by its source reference, passed to
+`deploy install <ref>`:
+
+| Format | Platform | Example |
+|---|---|---|
+| Bare hex ID (20+ chars) | GitHub Gist | `8d16744998afffeb8abb67c41bf29f73` |
+| Full URL | GitHub Gist (explicit) | `https://gist.github.com/user/8d16…` |
+| Full URL | GitHub repository | `https://github.com/user/repo` |
+| Full URL | Codeberg | `https://codeberg.org/user/repo` |
+| Full URL | Any Git server | `https://git.example.com/user/repo` |
+
+A bare hex ID MUST be treated as a GitHub Gist. All other sources
+MUST be specified as full URLs.
+
+**GitHub Gist is the recommended primary platform** for two reasons:
+a bare ID is sufficient (no URL needed), and Gists support a *secret*
+mode — not publicly listed or indexed, but cloneable by anyone who
+knows the ID. This makes a secret Gist suitable for packages intended
+for personal use or limited distribution without requiring
+authentication. Regular GitHub repositories do not offer this — they
+are either fully public or fully private (authentication required,
+incompatible with `deploy`).
 
 ---
 
@@ -290,10 +316,16 @@ deploy install <origin>
   1. resolve platform from origin (gist ID or URL)
   2. clone repository
   3. read manifest.json
-  4. detect OS and package manager
-  5. install missing packages from dependencies[<pkg-manager>]
-  6. call deploy.sh install
+  4. display package summary (name, version, description, author,
+     requires_root, active dependencies)
+  5. prompt for confirmation — abort unless user confirms or --yes passed
+  6. detect OS and package manager
+  7. install missing packages from dependencies[<pkg-manager>]
+  8. call deploy.sh install
 ```
+
+The confirmation prompt (step 5) MUST be skippable by passing `--yes`
+to `deploy install` to support non-interactive and automated use.
 
 Packages that require repository configuration before installation
 (e.g. nginx.org mainline, EPEL) MUST NOT be declared in `dependencies`
@@ -392,8 +424,18 @@ A bundle file allows installing a set of packages in one command
 }
 ```
 
-Packages are installed in order. The `deploy` tool MUST stop on first
-failure unless `--continue-on-error` is passed.
+Packages are installed in bundle order. The `deploy` tool MUST stop on
+the first failure. To proceed past failures and install the remaining
+packages, pass `--continue-on-error`:
+
+```bash
+deploy bundle server.json                    # stops on first failure
+deploy bundle server.json --continue-on-error  # reports failures, continues
+```
+
+When `--continue-on-error` is used, the tool MUST exit non-zero if any
+package failed, and MUST list all failed package references in its
+final output.
 
 ---
 
@@ -428,7 +470,7 @@ The package clone lives permanently at `path` — this is what
 | Item | Convention | Example |
 |---|---|---|
 | Package name | lowercase, hyphens | `nginx-module-vts` |
-| Gist repo | same as package name preferred | — |
+| Package repository | same as package name preferred | `nginx-module-vts` |
 | Script files | lowercase, hyphens, `.sh` | `hook.sh`, `deploy.sh` |
 | Config files | lowercase, hyphens, `.conf` | `apt-hook.conf` |
 | Version tags (git) | `v1.0.0` | `git tag v1.0.0` |

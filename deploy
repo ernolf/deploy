@@ -416,12 +416,13 @@ def _resolve_platform(arg: str) -> tuple:
 
 # == Package helpers ===========================================================
 
-def _pkg_clone(pkg_ref: str, dest: Path) -> None:
+def _pkg_clone(pkg_ref: str, dest: Path, quiet: bool = False) -> None:
     _platform, clone_url = _resolve_platform(pkg_ref)
-    subprocess.run(
-        ["git", "clone", clone_url, str(dest)],
-        check=True,
-    )
+    cmd = ["git", "clone"]
+    if quiet:
+        cmd.append("--quiet")
+    cmd += [clone_url, str(dest)]
+    subprocess.run(cmd, check=True)
 
 
 def _pkg_pull(path: Path) -> bool:
@@ -706,7 +707,7 @@ def cmd_inspect(ref: str) -> None:
 
 # == Command: install ==========================================================
 
-def cmd_install(ref: str, yes: bool = False) -> None:
+def cmd_install(ref: str, yes: bool = False, skip_installed: bool = False, quiet_clone: bool = False) -> None:
     if not ref:
         die("Usage: deploy install <gist-id|url> [--yes]")
 
@@ -720,7 +721,7 @@ def cmd_install(ref: str, yes: bool = False) -> None:
     platform, _ = _resolve_platform(ref)
     info(f"Cloning via {platform.name}: {ref} ...")
     try:
-        _pkg_clone(ref, tmp_dir)
+        _pkg_clone(ref, tmp_dir, quiet=quiet_clone)
     except subprocess.CalledProcessError:
         die(f"git clone failed: {ref}")
 
@@ -741,6 +742,9 @@ def cmd_install(ref: str, yes: bool = False) -> None:
 
     if _registry_is_installed(name):
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        if skip_installed:
+            info(f"Package '{name}' is already installed — skipping.")
+            return
         warn(f"Package '{name}' is already installed.")
         info(f"To update: deploy update {name}")
         sys.exit(1)
@@ -937,9 +941,9 @@ def cmd_list() -> None:
 
 # == Command: bundle ===========================================================
 
-def cmd_bundle(bundle_file: str) -> None:
+def cmd_bundle(bundle_file: str, continue_on_error: bool = False) -> None:
     if not bundle_file:
-        die("Usage: deploy bundle <bundle.json>")
+        die("Usage: deploy bundle <bundle.json> [--continue-on-error]")
 
     bundle_path = Path(bundle_file)
     if not bundle_path.is_file():
@@ -961,21 +965,31 @@ def cmd_bundle(bundle_file: str) -> None:
 
     info(f"Bundle: {description}")
     info(f"Installing {len(refs)} package(s) on {OS_CTX['OS']}/{OS_CTX['PKG_MANAGER']} ...")
+    if continue_on_error:
+        info("--continue-on-error: failures will be reported but will not stop installation.")
 
-    failed = 0
-    for ref in refs:
+    failed = []
+    total = len(refs)
+    for idx, ref in enumerate(refs, 1):
+        print()
+        print(f"── [{idx}/{total}] {ref} {'─' * max(0, 60 - len(ref))}──")
         try:
-            cmd_install(ref)
+            cmd_install(ref, yes=True, skip_installed=True, quiet_clone=True)
         except SystemExit as e:
             if e.code != 0:
                 warn(f"Failed to install: {ref}")
-                failed += 1
+                if not continue_on_error:
+                    die(f"Bundle aborted after failure. Pass --continue-on-error to proceed past failures.")
+                failed.append(ref)
 
     print()
-    if failed == 0:
+    if not failed:
         info("Bundle installation complete. All packages installed.")
     else:
-        die(f"Bundle installation finished with {failed} failure(s).")
+        warn(f"Bundle finished with {len(failed)} failure(s):")
+        for ref in failed:
+            warn(f"  - {ref}")
+        sys.exit(1)
 
 
 # == Command: platforms ========================================================
@@ -1008,7 +1022,8 @@ Usage:
   deploy status  [<name>]           Show status (all packages if omitted)
   deploy log     <name>             Show recent log (last 60 lines)
   deploy list                       List all installed packages
-  deploy bundle  <bundle.json>      Install all packages from bundle file
+  deploy bundle  <bundle.json>      Install all packages from bundle file (stops on first failure)
+  deploy bundle  <bundle.json> --continue-on-error   Report failures but install remaining packages
   deploy platforms                  List supported package source platforms
 
   <ref> is a short Gist ID, or a full URL for any other platform.
@@ -1053,7 +1068,7 @@ def main() -> None:
     elif cmd == "status":  cmd_status(arg2)
     elif cmd == "log":     cmd_log(arg2)
     elif cmd == "list":    cmd_list()
-    elif cmd == "bundle":    cmd_bundle(arg2)
+    elif cmd == "bundle":    cmd_bundle(arg2, continue_on_error="--continue-on-error" in args)
     elif cmd == "platforms": cmd_platforms()
     else:
         die(f"Unknown command: '{cmd}'. Run 'deploy --help'.")
