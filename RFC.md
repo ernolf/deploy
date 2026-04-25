@@ -201,14 +201,15 @@ changes.
 `deploy.sh` is the single entry point for all lifecycle operations.
 It MUST accept exactly one positional argument — the action name.
 
-### 5.1. Required Actions
+### 5.1. Actions
 
-| Action | Description |
-|---|---|
-| `install` | Full installation: create directories, install files/symlinks, start services. MUST be idempotent. |
-| `remove` | Undo everything `install` did. MUST leave no orphaned files. |
-| `status` | Print a human-readable status summary to stdout. MUST exit 0 if healthy, 1 if not installed, 2 if installed but broken. |
-| `update` | Called by `deploy` after `git pull`. Reinstall files/symlinks as needed, restart services if config changed. MUST be idempotent. |
+| Action | Required | Description |
+|---|---|---|
+| `install` | REQUIRED | Full installation: create directories, install files/symlinks, start services. MUST be idempotent. |
+| `remove` | REQUIRED | Remove automation, hooks, symlinks, and state files. Configuration files and built artifacts (e.g. compiled modules) are intentionally preserved so that dependent services keep running. Analogous to `apt-get remove`. MUST be idempotent. |
+| `status` | REQUIRED | Print a human-readable status summary to stdout. MUST exit 0 if healthy, 1 if not installed, 2 if installed but broken. |
+| `update` | REQUIRED | Called by `deploy` after `git pull`. Reinstall files/symlinks as needed, restart services if config changed. MUST be idempotent. |
+| `purge` | OPTIONAL | Full removal: everything `remove` does, plus all configuration files, built artifacts, and data directories deployed by `install`. MUST verify that no active service depends on the artifacts before removing them (e.g. check that a module is no longer referenced in a config file). If not implemented, `deploy purge` falls back to `remove`. Analogous to `apt-get purge`. MUST be idempotent. |
 
 ### 5.2. Exit Codes
 
@@ -217,13 +218,13 @@ It MUST accept exactly one positional argument — the action name.
 | 0 | Success (or: healthy, for `status`) |
 | 1 | Not installed / precondition not met (for `status`) |
 | 2 | Error / installed but broken (for `status`) |
-| Any non-zero | General failure for `install`, `remove`, `update` |
+| Any non-zero | General failure for `install`, `remove`, `update`, `purge` |
 
 ### 5.3. Logging
 
 - All output MUST go to stdout/stderr. The `deploy` tool captures and
   logs it.
-- Log lines for `install`, `remove`, `update` SHOULD be prefixed with
+- Log lines for `install`, `remove`, `update`, `purge` SHOULD be prefixed with
   a timestamp: `[2026-04-11 20:00:00] message`
 - `status` output is not logged — it is shown directly to the user.
 
@@ -483,6 +484,7 @@ The package clone lives permanently at `path` — this is what
 [ ] manifest.json with all required fields
 [ ] dependencies declared per package manager (apt, dnf, zypper, apk ...)
 [ ] deploy.sh implementing install / remove / status / update
+[ ] purge implemented if package deploys configs or artifacts that remove intentionally preserves
 [ ] deploy.sh is idempotent (safe to run twice)
 [ ] deploy.sh sources ${DEPLOY_LIB}/os-lib.sh for package management
 [ ] Platform-specific code guarded by $DEPLOY_PKG_MANAGER or $DEPLOY_OS_FAMILY
@@ -491,7 +493,8 @@ The package clone lives permanently at `path` — this is what
 [ ] Symlinks that need a specific owner use sudo -u <user>
 [ ] deploy.sh and all executable scripts committed with +x bit
 [ ] status exits 0/1/2 correctly
-[ ] remove undoes everything install did
+[ ] remove undoes automation/hooks/symlinks/state; preserves configs and artifacts
+[ ] purge (if implemented) removes all remaining configs, artifacts, and data directories
 [ ] Tested on a clean system
 ```
 
