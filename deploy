@@ -473,8 +473,9 @@ def _pkg_install_deps(pkg_path: Path) -> None:
 def _pkg_run(name: str, action: str, path: Path) -> int:
     """Run deploy.sh <action> with DEPLOY_* environment variables exported.
 
-    For 'status': output goes directly to stdout, not logged.
-    For all other actions: output is tee'd to both terminal and the package log.
+    Output goes directly to the terminal — no capturing, no rendering.
+    After the run, new entries from /var/log/apt/term.log are appended to the
+    package log so apt/dpkg activity is preserved without interfering with output.
     """
     deploy_sh = path / "deploy.sh"
     if not deploy_sh.is_file():
@@ -485,27 +486,27 @@ def _pkg_run(name: str, action: str, path: Path) -> int:
 
     env = _os_env()
 
-    if action == "status":
-        return subprocess.run([str(deploy_sh), action], env=env).returncode
+    apt_term_log = Path("/var/log/apt/term.log")
+    apt_log_pos = apt_term_log.stat().st_size if apt_term_log.is_file() else 0
 
     logfile = _pkg_log_path(name)
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     with open(logfile, "a") as log:
-        ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         log.write(f"─── deploy {action} {name} | {ts} ───\n")
-        log.flush()
 
-        proc = subprocess.Popen(
-            [str(deploy_sh), action],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        for line in proc.stdout:
-            sys.stdout.write(line)
-            sys.stdout.flush()
-            log.write(line)
-        proc.wait()
+    proc = subprocess.run([str(deploy_sh), action], env=env)
+
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(logfile, "a") as log:
+        log.write(f"─── exit {proc.returncode} | {ts} ───\n")
+        if apt_term_log.is_file():
+            with open(apt_term_log, "rb") as f:
+                f.seek(apt_log_pos)
+                apt_output = f.read()
+            if apt_output.strip():
+                log.write("─── apt/term.log ───\n")
+                log.write(apt_output.decode(errors="replace"))
+                log.write("\n")
 
     return proc.returncode
 
@@ -927,14 +928,14 @@ def cmd_list() -> None:
         info("No packages installed.")
         return
 
-    print(f"{'NAME':<28} {'VERSION':<8} {'GIST':<38} UPDATED")
+    print(f"{'NAME':<28} {'VERSION':<8} {'ORIGIN':<38} UPDATED")
     print(f"{'─' * 28} {'─' * 8} {'─' * 38} {'─' * 23}")
     for name in names:
         pkg = _registry_get(name)
         print(
             f"{pkg.get('name', ''):<28} "
             f"{pkg.get('version', ''):<8} "
-            f"{pkg.get('gist', ''):<38} "
+            f"{pkg.get('origin') or pkg.get('gist', ''):<38} "
             f"{pkg.get('updated_at', '')}"
         )
 
