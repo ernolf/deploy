@@ -69,7 +69,7 @@ Codeberg repo, or any public Git URL) with two required files:
 | File | Purpose |
 |---|---|
 | `manifest.json` | Package name, version, description, dependencies per package manager |
-| `deploy.sh` | Shell script implementing `install`, `remove`, `status`, `update` |
+| `deploy.sh` | Shell script implementing `install`, `remove`, `status`, `update`, and optionally `purge` |
 
 `deploy` clones the repository, reads the manifest, installs any missing
 system packages, shows you a summary, asks for confirmation, and then calls
@@ -82,7 +82,8 @@ deploy inspect <id|url>       # show package info and deploy.sh — nothing runs
 deploy install <id|url>       # clone, confirm, install
 deploy update  <name>         # git pull + re-run deploy.sh update
 deploy status  <name>         # health check
-deploy remove  <name>         # clean uninstall
+deploy remove  <name>         # remove automation and hooks; configs and artifacts preserved
+deploy purge   <name>         # full removal including configs (falls back to remove if not implemented)
 deploy list                   # all installed packages
 deploy bundle  <bundle.json>  # install everything from a list
 deploy platforms              # list supported source platforms
@@ -225,7 +226,8 @@ case "${1:-}" in
     remove)  echo "Removing ..."  ;;
     status)  echo "Status ..."    ;;
     update)  echo "Updating ..."  ;;
-    *) echo "Usage: deploy.sh <install|remove|status|update>" >&2; exit 1 ;;
+    purge)   echo "Purging ..."   ;;
+    *) echo "Usage: deploy.sh <install|remove|status|update|purge>" >&2; exit 1 ;;
 esac
 ```
 
@@ -278,11 +280,24 @@ A package consists of two files:
   dependencies  object   map of package manager → array of package names
                          Keys: apt, dnf, zypper, apk, pacman
 
-**deploy.sh** — must implement exactly these four actions:
-  install   install the software and register any hooks
-  remove    cleanly undo everything install did
-  status    print a health summary; exit 0 if OK, non-zero if not
-  update    re-apply after git pull (deploy already pulled)
+**deploy.sh** — must implement these actions (purge is optional):
+  install   install all files, configs, services, and hooks; MUST be idempotent
+  remove    remove automation, hooks, and state files; preserve configs and
+            artifacts so dependent services keep running (analogous to apt-get remove)
+  status    print a health summary; exit 0 if OK, non-zero if degraded;
+            end with "Overall: OK" or "Overall: DEGRADED"
+  update    re-apply after git pull; do NOT reinstall from scratch unless necessary
+  purge     (optional) full removal including configs and artifacts;
+            falls back to remove if not implemented (analogous to apt-get purge)
+
+Installation paths — SHOULD use /usr/local/ hierarchy:
+  /usr/local/bin/            executables and scripts
+  /usr/local/lib/            libraries
+  /usr/local/share/<pkg>/    data files managed by the package
+  /var/lib/<pkg>/            state files and version markers
+  Exceptions: Apache modules (/usr/lib/apache2/modules/), systemd units
+  (/etc/systemd/system/), apt hooks (/etc/apt/apt.conf.d/), user-editable
+  config (/etc/<pkg>/)
 
 Shell conventions:
   - Shebang: #!/usr/bin/env bash
