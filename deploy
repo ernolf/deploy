@@ -823,6 +823,49 @@ def cmd_remove(name: str) -> None:
     info(f"To delete the source files: rm -rf {pkg_path}")
 
 
+# == Command: purge ============================================================
+
+def cmd_purge(name: str) -> None:
+    if not name:
+        die("Usage: deploy purge <name>")
+
+    _registry_init()
+
+    pkg = _registry_get(name)
+    if not pkg:
+        die(f"Package '{name}' is not installed.")
+
+    pkg_path = Path(pkg["path"])
+    if not pkg_path.is_dir():
+        die(f"Package directory missing: {pkg_path}")
+
+    if _pkg_requires_root(pkg_path):
+        require_root(f"purge {name}")
+
+    step(f"Purging {name}")
+
+    rc = _pkg_run(name, "remove", pkg_path)
+    if rc != 0:
+        warn("deploy.sh remove exited with an error — continuing with purge.")
+
+    deploy_sh = pkg_path / "deploy.sh"
+    has_purge = bool(re.search(r'^\s+purge\b', deploy_sh.read_text(), re.MULTILINE))
+
+    if has_purge:
+        rc = _pkg_run(name, "purge", pkg_path)
+        if rc != 0:
+            die(f"deploy.sh purge failed for '{name}' — registry and clone kept. See: deploy log {name}")
+    else:
+        info(f"Package '{name}' does not implement purge — falling back to remove.")
+
+    _registry_remove(name)
+    info(f"Package '{name}' removed from registry.")
+
+    if pkg_path.exists():
+        shutil.rmtree(pkg_path)
+        info(f"Clone deleted: {pkg_path}")
+
+
 # == Command: update ===========================================================
 
 def cmd_update(target: str) -> None:
@@ -1017,7 +1060,8 @@ Usage:
   deploy me                         Install deploy itself (run once as root)
   deploy inspect <ref>              Show package info and deploy.sh without installing
   deploy install <ref> [--yes]      Clone and install a package
-  deploy remove  <name>             Remove package (keeps clone)
+  deploy remove  <name>             Remove package (keeps clone and config)
+  deploy purge   <name>             Remove package, config, build artifacts, and clone
   deploy update  me                 Update deploy itself from the repository
   deploy update  [<name>|--all]     git pull + re-run deploy.sh update
   deploy status  [<name>]           Show status (all packages if omitted)
@@ -1065,6 +1109,7 @@ def main() -> None:
     if   cmd == "inspect": cmd_inspect(arg2)
     elif cmd == "install": cmd_install(arg2, yes="--yes" in args)
     elif cmd == "remove":  cmd_remove(arg2)
+    elif cmd == "purge":   cmd_purge(arg2)
     elif cmd == "update":  cmd_update(arg2 or "--all")
     elif cmd == "status":  cmd_status(arg2)
     elif cmd == "log":     cmd_log(arg2)
