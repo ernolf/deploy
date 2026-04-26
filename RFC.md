@@ -408,6 +408,32 @@ git update-index --chmod=+x deploy.sh hook.sh
 git commit -m "chore: mark scripts executable"
 ```
 
+### 10.4. Installation Paths
+
+Deploy packages SHOULD install their files to the `/usr/local/` hierarchy
+to clearly separate self-managed software from files owned by the
+distribution's package manager:
+
+| File type | SHOULD use |
+|---|---|
+| Executables and scripts | `/usr/local/bin/` |
+| Libraries | `/usr/local/lib/` |
+| Architecture-independent data | `/usr/local/share/<package>/` |
+| State files and version markers | `/var/lib/<package>/` |
+
+This follows the FHS intent: `/usr/` is managed by the system package
+manager; `/usr/local/` is reserved for locally administered software.
+Using `/usr/local/` prevents accidental collisions with distro-package
+files and makes it immediately clear which files belong to `deploy`.
+
+Exceptions — where external tooling dictates a specific path outside
+`/usr/local/`:
+
+- Apache modules: `/usr/lib/apache2/modules/` (required by `apxs2`)
+- systemd unit files: `/etc/systemd/system/`
+- apt hook configuration: `/etc/apt/apt.conf.d/`
+- Configuration that the user edits directly: `/etc/<package>/`
+
 ---
 
 ## 11. Bundle Files
