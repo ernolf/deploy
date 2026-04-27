@@ -39,7 +39,7 @@ _DEPLOY_SH_TEMPLATE = """\
 # __NAME__ deploy script
 #
 # Conforms to the Mini-Deploy Package Standard.
-# Actions: install | remove | status | update
+# Actions: install | remove | status | update | purge (optional)
 
 set -euo pipefail
 
@@ -81,8 +81,14 @@ case "${1:-}" in
         # TODO: implement update
         ;;
 
+    purge)
+        log "Purging __NAME__ ..."
+        # TODO: implement purge (optional — full removal including configs/artifacts)
+        # If not needed, delete this block; deploy purge falls back to remove.
+        ;;
+
     *)
-        echo "Usage: $(basename "$0") <install|remove|status|update>" >&2
+        echo "Usage: $(basename "$0") <install|remove|status|update|purge>" >&2
         exit 1
         ;;
 esac
@@ -292,7 +298,7 @@ def cmd_init() -> None:
     print()
     print("  Next steps:")
     print("  1. Edit manifest.json — fill in dependencies per package manager")
-    print("  2. Implement deploy.sh — install / remove / status / update")
+    print("  2. Implement deploy.sh — install / remove / status / update / purge (optional)")
     print("  3. Run 'mkdeploy create' to publish as a GitHub Gist")
 
 

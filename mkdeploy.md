@@ -60,8 +60,8 @@ mkdeploy init
 `mkdeploy init` asks a few questions interactively and creates:
 
 - **`manifest.json`** — package metadata with dependency placeholders
-- **`deploy.sh`** — skeleton with all four required actions (`install`, `remove`,
-  `status`, `update`)
+- **`deploy.sh`** — skeleton with all required actions (`install`, `remove`,
+  `status`, `update`) plus an optional `purge` stub
 
 `deploy.sh` is created executable and ready to edit.
 
