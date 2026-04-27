@@ -420,6 +420,7 @@ distribution's package manager:
 | Libraries | `/usr/local/lib/` |
 | Architecture-independent data | `/usr/local/share/<package>/` |
 | State files and version markers | `/var/lib/<package>/` |
+| Log files | `/var/log/deploy/<package>/` |
 
 This follows the FHS intent: `/usr/` is managed by the system package
 manager; `/usr/local/` is reserved for locally administered software.
