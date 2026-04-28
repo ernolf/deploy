@@ -1060,8 +1060,8 @@ Usage:
   deploy me                         Install deploy itself (run once as root)
   deploy inspect <ref>              Show package info and deploy.sh without installing
   deploy install <ref> [--yes]      Clone and install a package
-  deploy remove  <name>             Remove package (keeps clone and config)
-  deploy purge   <name>             Remove package, config, build artifacts, and clone
+  deploy remove  <name>             Remove package automation (keeps clone, configs, artifacts)
+  deploy purge   <name>             Full removal including configs, artifacts, and clone
   deploy update  me                 Update deploy itself from the repository
   deploy update  [<name>|--all]     git pull + re-run deploy.sh update
   deploy status  [<name>]           Show status (all packages if omitted)
