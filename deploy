@@ -36,7 +36,7 @@ from pathlib import Path
 # URL of this tool's own source repository.
 # Change this when forking or maintaining your own distribution.
 
-DEPLOY_REPO_URL      = "https://raw.githubusercontent.com/ernolf/deploy_test/main"
+DEPLOY_REPO_URL      = "https://raw.githubusercontent.com/ernolf/deploy/main"
 DEPLOY_INSTALL_BIN   = Path("/usr/local/bin/deploy")
 MKDEPLOY_INSTALL_BIN = Path("/usr/local/bin/mkdeploy")
 
