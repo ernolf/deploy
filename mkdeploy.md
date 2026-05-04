@@ -43,8 +43,8 @@ If not, run `mkdeploy auth` once:
 mkdeploy auth
 ```
 
-It will open the GitHub token creation page, ask you to paste the token, validate
-it, and store it at `~/.config/deploy/github_token` (mode 600).
+It will print a link to the GitHub token creation page, ask you to paste the
+token, validate it, and store it at `~/.config/deploy/github_token` (mode 600).
 
 ---
 
@@ -59,9 +59,13 @@ mkdeploy init
 
 `mkdeploy init` asks a few questions interactively and creates:
 
-- **`manifest.json`** — package metadata with dependency placeholders
-- **`deploy.sh`** — skeleton with all required actions (`install`, `remove`,
-  `status`, `update`) plus an optional `purge` stub
+- **`manifest.json`** — package metadata, dependency placeholders, and a
+  `paths` section with a `prefix` anchor (`/usr/local` by default)
+- **`deploy.sh`** — skeleton with a `_manifest_get()` helper, a pre-configured
+  `Config` section (`PREFIX` from `paths.prefix`, `STATE_DIR` from
+  `DEPLOY_STATE_DIR_DIRNAME`, `LOG_DIR` from `DEPLOY_LOG_DIR_DIRNAME`), and all
+  required actions (`install`, `remove`, `status`, `update`) plus an optional
+  `purge` stub
 
 `deploy.sh` is created executable and ready to edit.
 

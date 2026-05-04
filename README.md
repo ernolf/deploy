@@ -210,6 +210,9 @@ A minimal package looks like this:
     "apt":    ["wget", "git"],
     "dnf":    ["wget", "git"],
     "pacman": ["wget", "git"]
+  },
+  "paths": {
+    "prefix": "/usr/local"
   }
 }
 ```
@@ -290,11 +293,15 @@ A package consists of two files:
   purge     (optional) full removal including configs and artifacts;
             falls back to remove if not implemented (analogous to apt-get purge)
 
-Installation paths — SHOULD use /usr/local/ hierarchy:
-  /usr/local/bin/            executables and scripts
-  /usr/local/lib/            libraries
-  /usr/local/share/<pkg>/    data files managed by the package
-  /var/lib/<pkg>/            state files and version markers
+Installation paths:
+  Prefix anchor (from manifest.json paths.prefix, default /usr/local):
+  ${PREFIX}/bin/             executables and scripts
+  ${PREFIX}/lib/             libraries
+  ${PREFIX}/share/<pkg>/     data files managed by the package
+  State directory (provided by deploy tool as DEPLOY_STATE_DIR_DIRNAME):
+  ${DEPLOY_STATE_DIR_DIRNAME}/deploy_<pkg>/   package state files
+  Log directory (provided by deploy tool as DEPLOY_LOG_DIR_DIRNAME):
+  ${DEPLOY_LOG_DIR_DIRNAME}/<pkg>/            package log files
   Exceptions: Apache modules (/usr/lib/apache2/modules/), systemd units
   (/etc/systemd/system/), apt hooks (/etc/apt/apt.conf.d/), user-editable
   config (/etc/<pkg>/)
@@ -309,7 +316,8 @@ Shell conventions:
 
 Environment variables available in deploy.sh:
   DEPLOY_OS, DEPLOY_OS_VERSION, DEPLOY_OS_FAMILY, DEPLOY_ARCH,
-  DEPLOY_PKG_MANAGER, DEPLOY_LIB
+  DEPLOY_PKG_MANAGER, DEPLOY_LIB,
+  DEPLOY_STATE_DIR_DIRNAME, DEPLOY_LOG_DIR_DIRNAME
 
 Functions from os-lib.sh (already sourced):
   pm_install <pkg...>    non-interactive package install

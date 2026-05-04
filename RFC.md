@@ -44,8 +44,9 @@ the OS abstraction library, and the package registry format.
 10. [File Permissions and Ownership](#10-file-permissions-and-ownership)
 11. [Bundle Files](#11-bundle-files)
 12. [Package Registry](#12-package-registry)
-13. [Naming Conventions](#13-naming-conventions)
-14. [Conformance Checklist](#14-conformance-checklist)
+13. [Deploy Tool Configuration](#13-deploy-tool-configuration)
+14. [Naming Conventions](#14-naming-conventions)
+15. [Conformance Checklist](#15-conformance-checklist)
 
 ---
 
@@ -165,6 +166,9 @@ incompatible with `deploy`).
     "zypper": ["gcc", "make", "pcre-devel", "libopenssl-devel", "zlib-devel", "wget", "git"],
     "apk":    ["build-base", "pcre-dev", "openssl-dev", "zlib-dev", "wget", "git"],
     "pacman": ["base-devel", "pcre", "openssl", "zlib", "wget", "git"]
+  },
+  "paths": {
+    "prefix": "/usr/local"
   }
 }
 ```
@@ -182,6 +186,7 @@ incompatible with `deploy`).
 | `requires_root` | bool | OPTIONAL | Whether `deploy.sh` MUST run as root. The `deploy` tool enforces this before calling `deploy.sh`. |
 | `tags` | array | OPTIONAL | Free-form tags. |
 | `dependencies` | object | OPTIONAL | Map of package manager name → array of package names. The `deploy` tool auto-installs missing dependencies before calling `deploy.sh install` or `deploy.sh update`. MUST only list packages available in the distribution's standard repository. Packages requiring special repository configuration MUST be handled explicitly in `deploy.sh`. |
+| `paths` | object | OPTIONAL | Map of path keys → absolute path values. Declares the package-specific installation locations that are not provided by the deploy tool. `deploy.sh` reads these at startup via `_manifest_get` and derives all child paths from them. The state directory and log directory are NOT listed here — they are derived from `DEPLOY_STATE_DIR_DIRNAME` and `DEPLOY_LOG_DIR_DIRNAME` (see §6). |
 
 ### 4.3. Versioning
 
@@ -193,6 +198,61 @@ The `version` field MUST be incremented when:
 
 The `version` field SHOULD NOT be changed for documentation-only
 changes.
+
+### 4.4. Paths
+
+The `paths` object is the single point of truth for all package-specific
+installation locations. No path literal appears more than once across
+`manifest.json` and `deploy.sh` — every path variable is either read
+directly from `paths` or derived from a value read from `paths`.
+
+**What belongs in `paths`:**
+
+- `prefix` — root anchor for everything the package installs under a
+  configurable hierarchy (typically `/usr/local`). All child paths
+  under `prefix` are computed in `deploy.sh` and are NOT listed in
+  `paths`.
+- Any absolute path that is not derivable from `prefix` and is not
+  already provided by the deploy tool — for example a config directory
+  under `/etc/`.
+
+**What does NOT belong in `paths`:**
+
+- The package state directory. It is constructed in `deploy.sh` as
+  `${DEPLOY_STATE_DIR_DIRNAME}/deploy_<name>` using the env var
+  provided by the deploy tool (see §6).
+- The package log directory. It is constructed as
+  `${DEPLOY_LOG_DIR_DIRNAME}/<name>` using the env var provided by
+  the deploy tool (see §6).
+- Runtime-detected values (e.g. a module path discovered via a tool
+  flag). These are written to `${STATE_DIR}/config.json` by
+  `deploy.sh install` and read back by all other actions.
+
+**Reading `paths` in `deploy.sh`:**
+
+```bash
+_manifest_get() {
+    python3 -c "
+import json, sys
+try:
+    d = json.load(open('${PACKAGE_DIR}/manifest.json', encoding='utf-8'))
+    print(d.get('paths', {}).get('$1', ''))
+except Exception:
+    print('')
+" 2>/dev/null
+}
+
+# == Config ====================================================================
+
+PREFIX="$(_manifest_get prefix)";     PREFIX="${PREFIX:-/usr/local}"
+CONF_DIR="$(_manifest_get conf_dir)"; CONF_DIR="${CONF_DIR:-/etc/mypackage}"
+STATE_DIR="${DEPLOY_STATE_DIR_DIRNAME}/deploy_mypackage"
+LOG_DIR="${DEPLOY_LOG_DIR_DIRNAME}/mypackage"
+
+# Paths derived from PREFIX — NOT listed in manifest.json:
+HOOK_DIR="${PREFIX}/lib/mypackage"
+SRC_DIR="${PREFIX}/src/mypackage"
+```
 
 ---
 
@@ -263,6 +323,8 @@ the current OS and exports the following environment variables:
 | `DEPLOY_PKG_MANAGER` | `apt`, `dnf`, `yum`, `zypper`, `apk`, `pacman` | Detected package manager |
 | `DEPLOY_ARCH` | `x86_64`, `aarch64`, `armv7l` | CPU architecture from `uname -m` |
 | `DEPLOY_LIB` | `/var/lib/deploy/lib` | Path to the deploy OS abstraction library |
+| `DEPLOY_STATE_DIR_DIRNAME` | `/var/lib` | Parent directory for package state directories. The package constructs its state directory as `${DEPLOY_STATE_DIR_DIRNAME}/deploy_<name>`. Configurable via `/etc/deploy/deploy.conf`. |
+| `DEPLOY_LOG_DIR_DIRNAME` | `/var/log/deploy` | Parent directory for package log directories. The package constructs its log directory as `${DEPLOY_LOG_DIR_DIRNAME}/<name>`. Configurable via `/etc/deploy/deploy.conf`. |
 
 These variables are available to `deploy.sh` without any additional
 setup.
@@ -488,12 +550,104 @@ The `deploy` tool maintains a registry at `/var/lib/deploy/registry.json`:
 }
 ```
 
-The package clone lives permanently at `path` — this is what
-`deploy update` pulls into and what `deploy.sh` is called from.
+The package clone lives permanently at `path` and is treated as
+read-only. Before any action is executed, the deploy tool copies the
+package to a staging directory (see §13) from which `deploy.sh` is
+called.
 
 ---
 
-## 13. Naming Conventions
+## 13. Deploy Tool Configuration
+
+### 13.1. Configuration File
+
+The deploy tool reads its own configuration from `/etc/deploy/deploy.conf`
+on startup. The file is optional — if absent, all settings fall back to
+their compiled-in defaults.
+
+**Format:** `KEY="value"` pairs, one per line. Everything from `#` to
+the end of the line is a comment. Empty lines are ignored.
+
+```
+# /etc/deploy/deploy.conf
+
+STATE_DIR_DIRNAME="/var/lib"       # parent dir for package state directories
+LOG_DIR_DIRNAME="/var/log/deploy"  # parent dir for package log directories
+```
+
+| Setting | Default | Description |
+|---|---|---|
+| `STATE_DIR_DIRNAME` | `/var/lib` | Parent directory under which each package's state directory is created as `<STATE_DIR_DIRNAME>/deploy_<name>`. |
+| `LOG_DIR_DIRNAME` | `/var/log/deploy` | Parent directory under which each package's log directory is created as `<LOG_DIR_DIRNAME>/<name>`. |
+
+Both values are exported to `deploy.sh` as `DEPLOY_STATE_DIR_DIRNAME`
+and `DEPLOY_LOG_DIR_DIRNAME` respectively (see §6).
+
+### 13.2. Package Staging
+
+The deploy tool maintains two separate locations per package:
+
+| Path | Purpose |
+|---|---|
+| `/var/lib/deploy/packages/<name>/` | Git checkout — read-only, never modified after clone. `deploy update` runs `git pull` here. |
+| `/var/lib/deploy/<name>/` | Staging copy — working directory from which `deploy.sh` is executed. |
+
+Before every action, the deploy tool refreshes the staging copy:
+
+1. Copy: `cp -a packages/<name>/ <name>/`
+2. Normalize line endings in all shell scripts: `find <name>/ -name "*.sh" -exec sed -i 's/\r$//' {} \;`
+3. Set executable bit on all shell scripts: `find <name>/ -name "*.sh" -exec chmod +x {} \;`
+4. Execute: `<name>/deploy.sh <action>`
+
+`PACKAGE_DIR` inside `deploy.sh` resolves to the staging directory.
+
+### 13.3. State Directory Management
+
+The deploy tool creates and owns the package state directory
+`${DEPLOY_STATE_DIR_DIRNAME}/deploy_<name>` before calling
+`deploy.sh install`.
+
+The `deploy_` prefix is a fixed naming convention — it is not
+configurable. It ensures all deploy-managed state directories are
+immediately identifiable and group together when listing the parent
+directory.
+
+**On first install:**
+
+- Directory does not exist: create it, write marker file and README.
+- Directory exists with marker file present: proceed without
+  modification (idempotent).
+- Directory exists without marker file: print a warning and require
+  explicit confirmation before proceeding. The directory may be owned
+  by another application.
+
+**Marker file:** `${DEPLOY_STATE_DIR_DIRNAME}/deploy_<name>/.deploy-managed`
+
+A zero-byte file. Its presence identifies the directory as managed by
+the deploy tool. The package name is implicit in the directory path.
+
+**README file:** `${DEPLOY_STATE_DIR_DIRNAME}/deploy_<name>/README`
+
+Written by the deploy tool on first install:
+
+```
+This directory is managed by the deploy tool.
+Do not edit files here manually.
+
+To update:  deploy update <name>
+To remove:  deploy remove <name>
+To purge:   deploy purge <name>
+```
+
+A README with equivalent content is written to the package log
+directory `${DEPLOY_LOG_DIR_DIRNAME}/<name>/` when it is first created.
+
+**On purge:** The deploy tool removes the state directory in its
+entirety after `deploy.sh purge` completes successfully.
+
+---
+
+## 14. Naming Conventions
 
 | Item | Convention | Example |
 |---|---|---|
@@ -505,11 +659,14 @@ The package clone lives permanently at `path` — this is what
 
 ---
 
-## 14. Conformance Checklist
+## 15. Conformance Checklist
 
 ```
 [ ] manifest.json with all required fields
 [ ] dependencies declared per package manager (apt, dnf, zypper, apk ...)
+[ ] paths declared in manifest.json for prefix and any non-derivable package-specific paths
+[ ] state_dir and log_dir NOT in manifest.json paths — constructed from DEPLOY_STATE_DIR_DIRNAME/DEPLOY_LOG_DIR_DIRNAME in deploy.sh
+[ ] runtime-detected values written to ${STATE_DIR}/config.json by install, read back by all other actions
 [ ] deploy.sh implementing install / remove / status / update
 [ ] purge implemented if package deploys configs or artifacts that remove intentionally preserves
 [ ] deploy.sh is idempotent (safe to run twice)
