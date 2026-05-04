@@ -439,6 +439,14 @@ def _resolve_platform(arg: str) -> tuple:
     )
 
 
+def _try_resolve_platform(arg: str):
+    """Like _resolve_platform but returns None if arg is not a recognised reference."""
+    for p in PLATFORMS:
+        if p.can_handle(arg):
+            return p, p.to_clone_url(arg)
+    return None
+
+
 # == Package helpers ===========================================================
 
 def _pkg_clone(pkg_ref: str, dest: Path, quiet: bool = False) -> None:
@@ -807,6 +815,20 @@ def cmd_install(ref: str, yes: bool = False, skip_installed: bool = False, quiet
     require_git()
     _registry_init()
 
+    # If the argument is not a recognised platform reference, try a registry name lookup.
+    # This allows `deploy install <name>` to reinstall a known package using its stored origin.
+    if not _try_resolve_platform(ref):
+        pkg = _registry_get(ref)
+        if pkg:
+            origin = pkg.get("origin", "")
+            if origin:
+                info(f"'{ref}' is a package name — using stored origin: {origin}")
+                ref = origin
+            else:
+                die(f"Package '{ref}' has no origin stored in registry — cannot reinstall by name.")
+        else:
+            _resolve_platform(ref)  # will die with the standard platform error message
+
     tmp_dir = PACKAGES_DIR / f".tmp-{ref[:40]}"
     if tmp_dir.exists():
         shutil.rmtree(tmp_dir)
@@ -880,7 +902,33 @@ def cmd_install(ref: str, yes: bool = False, skip_installed: bool = False, quiet
     rc = _pkg_run(name, "install", pkg_path)
     if rc != 0:
         _registry_remove(name)
-        die(f"deploy.sh install failed for '{name}'. See: deploy log {name}")
+        warn(f"deploy.sh install failed for '{name}'.")
+        info(f"Build log: deploy log {name}")
+        print()
+        try:
+            answer = input("  Clean up partial installation? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+            print()
+        if answer in ("y", "yes"):
+            info("Running cleanup ...")
+            _pkg_run(name, "purge", pkg_path)  # best-effort; ignore return code
+            stage_path = DEPLOY_HOME / name
+            if stage_path.exists():
+                shutil.rmtree(stage_path)
+            state_dir = STATE_DIR_DIRNAME / f"deploy_{name}"
+            if state_dir.is_dir():
+                shutil.rmtree(state_dir)
+            if pkg_path.exists():
+                shutil.rmtree(pkg_path)
+            info(f"Cleaned up. Build log preserved at: {LOG_DIR / name}")
+        else:
+            info("Left in place. To clean up manually:")
+            info(f"  deploy.sh purge  (in {DEPLOY_HOME / name})")
+            info(f"  rm -rf {pkg_path}")
+            info(f"  rm -rf {DEPLOY_HOME / name}")
+            info(f"  rm -rf {STATE_DIR_DIRNAME / ('deploy_' + name)}")
+        sys.exit(1)
 
     _registry_add(name, ref, version, description, pkg_path)
     info(f"Package '{name}' {version} installed successfully.")
@@ -900,7 +948,13 @@ def cmd_remove(name: str) -> None:
 
     pkg_path = Path(pkg["path"])
     if not pkg_path.is_dir():
-        die(f"Package directory missing: {pkg_path}")
+        warn(f"Clone missing: {pkg_path}")
+        info("Removing registry entry only — deploy.sh remove was not run.")
+        _registry_remove(name)
+        stage_path = DEPLOY_HOME / name
+        if stage_path.exists():
+            shutil.rmtree(stage_path)
+        return
 
     if _pkg_requires_root(pkg_path):
         require_root(f"remove {name}")
@@ -935,7 +989,24 @@ def cmd_purge(name: str) -> None:
 
     pkg_path = Path(pkg["path"])
     if not pkg_path.is_dir():
-        die(f"Package directory missing: {pkg_path}")
+        origin = pkg.get("origin", "")
+        if origin:
+            info(f"Clone missing — re-cloning from origin to run purge script ...")
+            try:
+                _pkg_clone(origin, pkg_path, quiet=True)
+            except subprocess.CalledProcessError:
+                warn("Re-clone failed — removing registry entry and state dir only.")
+                _registry_remove(name)
+                stage_path = DEPLOY_HOME / name
+                if stage_path.exists():
+                    shutil.rmtree(stage_path)
+                state_dir = STATE_DIR_DIRNAME / f"deploy_{name}"
+                if state_dir.is_dir():
+                    shutil.rmtree(state_dir)
+                    info(f"State directory removed: {state_dir}")
+                return
+        else:
+            die(f"Package directory missing and no origin stored: {pkg_path}")
 
     if _pkg_requires_root(pkg_path):
         require_root(f"purge {name}")
